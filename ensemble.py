@@ -18,7 +18,7 @@ def run_ensemble():
     id_col = meta["id_col"]
     y_true = train_df[target_col].values
 
-    models = ["resnet", "dcnv2", "fttransformer"]
+    models = ["resnet", "swiglu", "fttransformer"]
     oof_dict = {}
     test_dict = {}
 

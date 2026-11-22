@@ -4,6 +4,7 @@ import random
 import pickle
 import numpy as np
 import pandas as pd
+from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
@@ -51,6 +52,8 @@ def train_model(model_name):
     test_loader = DataLoader(TabularDataset(test_df, num_cols, cat_cols), batch_size=CFG.BATCH_SIZE * 2, shuffle=False)
     scaler = torch.amp.GradScaler("cuda", enabled=CFG.USE_AMP)
 
+    warmup_epochs = 3
+
     print(f"\n================ BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()} ================")
     for fold in range(CFG.N_FOLDS):
         trn_df = train_df[train_df["fold"] != fold].reset_index(drop=True)
@@ -69,7 +72,16 @@ def train_model(model_name):
         model = build_model(model_name, len(num_cols), cat_dims).to(device)
         criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.LR, weight_decay=CFG.WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.EPOCHS, eta_min=1e-5)
+        
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, CFG.EPOCHS - warmup_epochs), eta_min=1e-5
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+        )
 
         best_auc = 0.0
         best_val_preds = None
@@ -97,7 +109,7 @@ def train_model(model_name):
                     with torch.amp.autocast("cuda", enabled=CFG.USE_AMP):
                         probs = torch.sigmoid(model(num_x, cat_x))
                     val_probs.append(probs.cpu().numpy())
-            val_probs = np.concatenate(val_probs)
+            val_probs = np.concatenate(val_probs).astype(np.float64)
             val_auc = roc_auc_score(val_df[target_col].values, val_probs)
 
             if val_auc > best_auc:
@@ -111,8 +123,11 @@ def train_model(model_name):
                     break
 
         print(f"[{model_name.upper()}] Fold {fold + 1}/{CFG.N_FOLDS} - Best Val AUC: {best_auc:.5f}")
-        oof_preds[val_idx] = best_val_preds
+        
+        # Rank-normalize trên từng fold để triệt tiêu lệch thang đo giữa các fold
+        oof_preds[val_idx] = rankdata(best_val_preds) / len(best_val_preds)
 
+        # Dự đoán Test và Rank-normalize theo từng fold trước khi cộng trung bình
         model.load_state_dict(torch.load(ckpt_path))
         model.eval()
         fold_test = []
@@ -122,7 +137,8 @@ def train_model(model_name):
                 with torch.amp.autocast("cuda", enabled=CFG.USE_AMP):
                     probs = torch.sigmoid(model(num_x, cat_x))
                 fold_test.append(probs.cpu().numpy())
-        test_preds += np.concatenate(fold_test) / CFG.N_FOLDS
+        fold_test_probs = np.concatenate(fold_test).astype(np.float64)
+        test_preds += (rankdata(fold_test_probs) / len(fold_test_probs)) / CFG.N_FOLDS
 
     overall_auc = roc_auc_score(train_df[target_col].values, oof_preds)
     print(f">>> [{model_name.upper()}] OVERALL OOF ROC-AUC: {overall_auc:.5f} <<<\n")
@@ -132,6 +148,6 @@ def train_model(model_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True, choices=["resnet", "dcnv2", "fttransformer"])
+    parser.add_argument("--model", type=str, required=True, choices=["resnet", "swiglu", "fttransformer"])
     args = parser.parse_args()
     train_model(args.model)

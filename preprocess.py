@@ -8,73 +8,100 @@ from config import CFG
 
 warnings.filterwarnings("ignore")
 
+def build_clean_features(df):
+    df = df.copy()
+
+    bool_cols = [
+        "is_foreign_transaction", "is_new_merchant", "used_vpn",
+        "ip_country_mismatch", "billing_shipping_mismatch", "is_ai_generated_scam_attempt"
+    ]
+    for c in bool_cols:
+        df[c] = df[c].astype(int)
+
+    # 1. Tổng cờ rủi ro & bitmask tổ hợp
+    df["total_red_flags"] = df[bool_cols].sum(axis=1).astype(np.float32)
+    df["high_risk_combo"] = (
+        df["is_foreign_transaction"] * 16 +
+        df["used_vpn"] * 8 +
+        df["ip_country_mismatch"] * 4 +
+        df["billing_shipping_mismatch"] * 2 +
+        df["is_ai_generated_scam_attempt"] * 1
+    ).astype(str)
+
+    # 2. Tỷ số tài chính & vận tốc vật lý cốt lõi
+    df["amount_to_balance_ratio"] = (df["amount_usd"] / (df["account_balance_usd"].clip(lower=0) + 1.0)).astype(np.float32)
+    df["travel_speed_kmh"] = (df["distance_from_home_km"] / (df["hours_since_last_txn"].clip(lower=0) + 0.1)).astype(np.float32)
+    df["cvv_fail_rate"] = (df["cvv_retry_count"] / (df["txn_count_last_24h"] + 1.0)).astype(np.float32)
+    df["risk_x_velocity"] = (df["merchant_risk_score"] * df["velocity_score"]).astype(np.float32)
+    df["amount_x_risk"] = (np.log1p(df["amount_usd"].clip(lower=0)) * df["merchant_risk_score"]).astype(np.float32)
+
+    # 3. Chu kỳ thời gian
+    df["hour_sin"] = np.sin(2 * np.pi * df["time_of_day_hour"] / 24.0).astype(np.float32)
+    df["hour_cos"] = np.cos(2 * np.pi * df["time_of_day_hour"] / 24.0).astype(np.float32)
+
+    # 4. Cặp tương tác phân loại chọn lọc
+    df["inter_merch_channel"] = df["merchant_category"].astype(str) + "_" + df["channel"].astype(str)
+    df["inter_auth_device"] = df["auth_method"].astype(str) + "_" + df["device_type"].astype(str)
+
+    return df
+
 def run_preprocessing():
     print("1. Đang đọc dữ liệu gốc...")
-    train_df = pd.read_csv(CFG.TRAIN_PATH)
+    train_df = pd.read_csv(CFG.TRAIN_PATH).dropna(subset=["is_fraud"]).reset_index(drop=True)
     test_df = pd.read_csv(CFG.TEST_PATH)
 
-    id_col = "id" if "id" in train_df.columns else train_df.columns[0]
-    target_col = [c for c in train_df.columns if c not in test_df.columns][0]
-    base_features = [c for c in test_df.columns if c != id_col]
+    id_col, target_col = "id", "is_fraud"
+    train_df[target_col] = train_df[target_col].astype(np.float32)
 
-    cat_cols = [
-        c for c in base_features
-        if train_df[c].dtype == "object" or train_df[c].nunique() < 30
-    ]
-    num_cols = [c for c in base_features if c not in cat_cols]
+    base_features = [c for c in test_df.columns if c != id_col]
+    train_df["row_null_count"] = train_df[base_features].isnull().sum(axis=1).astype(np.float32)
+    test_df["row_null_count"] = test_df[base_features].isnull().sum(axis=1).astype(np.float32)
+
+    train_df = build_clean_features(train_df)
+    test_df = build_clean_features(test_df)
 
     skf = StratifiedKFold(n_splits=CFG.N_FOLDS, shuffle=True, random_state=CFG.SEED)
     train_df["fold"] = -1
     for fold, (_, val_idx) in enumerate(skf.split(train_df, train_df[target_col])):
         train_df.loc[val_idx, "fold"] = fold
 
-    print("2. Tạo Frequency Encoding & Group Aggregations...")
-    full_df = pd.concat([train_df[base_features], test_df[base_features]], axis=0).reset_index(drop=True)
-    new_num_cols = []
+    cat_cols = [
+        "merchant_category", "card_type", "auth_method", "channel", "device_type",
+        "time_of_day_hour", "day_of_week", "cvv_retry_count", "prior_disputes",
+        "high_risk_combo", "inter_merch_channel", "inter_auth_device"
+    ]
 
-    for c in cat_cols:
-        freq = full_df[c].value_counts()
-        col_name = f"{c}_freq"
-        train_df[col_name] = train_df[c].map(freq).fillna(0).astype(np.float32)
-        test_df[col_name] = test_df[c].map(freq).fillna(0).astype(np.float32)
-        new_num_cols.append(col_name)
+    num_cols = [
+        "amount_usd", "hours_since_last_txn", "txn_count_last_24h",
+        "distance_from_home_km", "card_age_months", "customer_age",
+        "account_balance_usd", "cvv_retry_count", "velocity_score",
+        "merchant_risk_score", "prior_disputes",
+        "is_foreign_transaction", "is_new_merchant", "used_vpn",
+        "ip_country_mismatch", "billing_shipping_mismatch", "is_ai_generated_scam_attempt",
+        "row_null_count", "total_red_flags", "amount_to_balance_ratio",
+        "travel_speed_kmh", "cvv_fail_rate", "risk_x_velocity",
+        "amount_x_risk", "hour_sin", "hour_cos"
+    ]
 
-    top_cats = [c for c in cat_cols if 2 < train_df[c].nunique() < 50][:3]
-    top_nums = num_cols[:5]
-    for c in top_cats:
-        for n in top_nums:
-            grp_mean = full_df.groupby(c)[n].transform("mean")
-            train_mean = grp_mean.iloc[:len(train_df)].values
-            test_mean = grp_mean.iloc[len(train_df):].values
+    # Chỉ giữ Z-score cho 3 nhóm quan trọng nhất (không tạo OOF Target Encoding gây overfit)
+    full_df = pd.concat([train_df, test_df], axis=0).reset_index(drop=True)
+    for grp_col, val_col in [("merchant_category", "amount_usd"), ("card_type", "amount_usd"), ("device_type", "velocity_score")]:
+        grp_mean = full_df.groupby(grp_col)[val_col].transform("mean")
+        grp_std = full_df.groupby(grp_col)[val_col].transform("std").fillna(1.0)
+        z_col = f"{val_col}_z_by_{grp_col}"
+        train_df[z_col] = ((train_df[val_col].values - grp_mean.iloc[:len(train_df)].values) / (grp_std.iloc[:len(train_df)].values + 1e-5)).astype(np.float32)
+        test_df[z_col] = ((test_df[val_col].values - grp_mean.iloc[len(train_df):].values) / (grp_std.iloc[len(train_df):].values + 1e-5)).astype(np.float32)
+        num_cols.append(z_col)
 
-            diff_col = f"{n}_diff_mean_by_{c}"
-            train_df[diff_col] = (train_df[n].values - train_mean).astype(np.float32)
-            test_df[diff_col] = (test_df[n].values - test_mean).astype(np.float32)
-            new_num_cols.append(diff_col)
+    # Frequency encoding chọn lọc cho 5 cột phân loại chính
+    for c in ["merchant_category", "card_type", "auth_method", "channel", "device_type"]:
+        freq = full_df[c].astype(str).value_counts()
+        f_col = f"{c}_freq"
+        train_df[f_col] = train_df[c].astype(str).map(freq).fillna(0).astype(np.float32)
+        test_df[f_col] = test_df[c].astype(str).map(freq).fillna(0).astype(np.float32)
+        num_cols.append(f_col)
 
-    print("3. Tạo Out-Of-Fold Target Encoding...")
-    global_mean = train_df[target_col].mean()
-    smoothing = 20.0
-    for c in cat_cols:
-        te_col = f"{c}_oof_te"
-        train_df[te_col] = np.nan
-        for fold in range(CFG.N_FOLDS):
-            trn = train_df[train_df["fold"] != fold]
-            stats = trn.groupby(c)[target_col].agg(["count", "mean"])
-            smooth_te = (stats["count"] * stats["mean"] + smoothing * global_mean) / (stats["count"] + smoothing)
-
-            val_mask = train_df["fold"] == fold
-            train_df.loc[val_mask, te_col] = train_df.loc[val_mask, c].map(smooth_te).fillna(global_mean)
-
-        full_stats = train_df.groupby(c)[target_col].agg(["count", "mean"])
-        full_smooth = (full_stats["count"] * full_stats["mean"] + smoothing * global_mean) / (full_stats["count"] + smoothing)
-        test_df[te_col] = test_df[c].map(full_smooth).fillna(global_mean)
-        new_num_cols.append(te_col)
-
-    all_num_cols = num_cols + new_num_cols
-
-    print("4. Xử lý Missing & Biến đổi Quantile-Normal cho Neural Networks...")
-    for c in all_num_cols:
+    for c in num_cols:
         med = train_df[c].median()
         train_df[c] = train_df[c].fillna(med).replace([np.inf, -np.inf], med)
         test_df[c] = test_df[c].fillna(med).replace([np.inf, -np.inf], med)
@@ -82,37 +109,26 @@ def run_preprocessing():
     qt = QuantileTransformer(n_quantiles=1000, output_distribution="normal", random_state=CFG.SEED)
     scaler = StandardScaler()
 
-    train_num_qt = qt.fit_transform(train_df[all_num_cols])
-    test_num_qt = qt.transform(test_df[all_num_cols])
-
-    train_df[all_num_cols] = scaler.fit_transform(train_num_qt).astype(np.float32)
-    test_df[all_num_cols] = scaler.transform(test_num_qt).astype(np.float32)
+    train_df[num_cols] = scaler.fit_transform(qt.fit_transform(train_df[num_cols])).astype(np.float32)
+    test_df[num_cols] = scaler.transform(qt.transform(test_df[num_cols])).astype(np.float32)
 
     cat_dims = []
-    if len(cat_cols) > 0:
-        for c in cat_cols:
-            train_df[c] = train_df[c].astype(str).fillna("MISSING")
-            test_df[c] = test_df[c].astype(str).fillna("MISSING")
-        oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        train_df[cat_cols] = oe.fit_transform(train_df[cat_cols]).astype(np.int64) + 1
-        test_df[cat_cols] = oe.transform(test_df[cat_cols]).astype(np.int64) + 1
-        for c in cat_cols:
-            cat_dims.append(int(max(train_df[c].max(), test_df[c].max()) + 1))
+    for c in cat_cols:
+        train_df[c] = train_df[c].astype(str).fillna("MISSING")
+        test_df[c] = test_df[c].astype(str).fillna("MISSING")
+    oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    train_df[cat_cols] = oe.fit_transform(train_df[cat_cols]).astype(np.int64) + 1
+    test_df[cat_cols] = oe.transform(test_df[cat_cols]).astype(np.int64) + 1
+    for c in cat_cols:
+        cat_dims.append(int(max(train_df[c].max(), test_df[c].max()) + 1))
 
     train_df.to_parquet(f"{CFG.ARTIFACT_DIR}/train_proc.parquet", index=False)
     test_df.to_parquet(f"{CFG.ARTIFACT_DIR}/test_proc.parquet", index=False)
 
-    meta = {
-        "id_col": id_col,
-        "target_col": target_col,
-        "num_cols": all_num_cols,
-        "cat_cols": cat_cols,
-        "cat_dims": cat_dims
-    }
     with open(f"{CFG.ARTIFACT_DIR}/meta.pkl", "wb") as f:
-        pickle.dump(meta, f)
+        pickle.dump({"id_col": id_col, "target_col": target_col, "num_cols": num_cols, "cat_cols": cat_cols, "cat_dims": cat_dims}, f)
 
-    print(f"Hoàn tất! Tổng số đặc trưng: {len(all_num_cols)} num + {len(cat_cols)} cat.")
+    print(f"Hoàn tất! Bộ đặc trưng tinh gọn: {len(num_cols)} cột số + {len(cat_cols)} cột Embedding.")
 
 if __name__ == "__main__":
     run_preprocessing()

@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class PeriodicNumericalEmbedding(nn.Module):
     def __init__(self, num_features, n_frequencies=8, sigma=0.1):
@@ -11,6 +12,9 @@ class PeriodicNumericalEmbedding(nn.Module):
         v = 2 * np.pi * x.unsqueeze(-1) * self.weights.unsqueeze(0)
         return torch.cat([torch.sin(v), torch.cos(v)], dim=-1).flatten(start_dim=1)
 
+# ---------------------------------------------------------
+# KIẾN TRÚC 1: TABULAR RESNET + PERIODIC EMBEDDINGS
+# ---------------------------------------------------------
 class ResNetBlock(nn.Module):
     def __init__(self, dim, dropout):
         super().__init__()
@@ -62,61 +66,64 @@ class TabularResNet(nn.Module):
             x = b(x)
         return self.head(x).squeeze(-1)
 
-class CrossLayerV2(nn.Module):
-    def __init__(self, dim, rank=64):
+# ---------------------------------------------------------
+# KIẾN TRÚC 2: SWIGLU-NET (THAY THẾ DCNV2 - CHUYÊN TRỊ TỶ SỐ)
+# ---------------------------------------------------------
+class SwiGLUBlock(nn.Module):
+    def __init__(self, dim, dropout):
         super().__init__()
-        self.u = nn.Linear(dim, rank, bias=False)
-        self.v = nn.Linear(rank, dim, bias=True)
-        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(dim)
+        self.w_gate = nn.Linear(dim, dim * 2)
+        self.w_out = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x0, xl):
-        return x0 * self.v(self.act(self.u(xl))) + xl
+    def forward(self, x):
+        h = self.norm(x)
+        gate, val = self.w_gate(h).chunk(2, dim=-1)
+        h = F.silu(gate) * val
+        return x + self.dropout(self.w_out(h))
 
-class DCNv2(nn.Module):
-    def __init__(self, num_features, cat_dims, hidden_dim=384, num_cross=3, num_deep=3, dropout=0.25):
+class SwiGLUNet(nn.Module):
+    def __init__(self, num_features, cat_dims, hidden_dim=384, num_blocks=3, dropout=0.25):
         super().__init__()
         self.embeddings = nn.ModuleList([
             nn.Embedding(c, min(32, (c + 1) // 2)) for c in cat_dims
         ])
         emb_dim = sum(e.embedding_dim for e in self.embeddings)
+
+        # Learnable Feature Scaling giống kiến trúc RealMLP
+        self.num_scale = nn.Parameter(torch.ones(1, num_features)) if num_features > 0 else None
         in_dim = num_features + emb_dim
 
-        self.in_norm = nn.BatchNorm1d(in_dim)
-        self.cross_layers = nn.ModuleList([CrossLayerV2(in_dim, rank=64) for _ in range(num_cross)])
-
-        deep_layers = []
-        curr_dim = in_dim
-        for _ in range(num_deep):
-            deep_layers.extend([
-                nn.Linear(curr_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            ])
-            curr_dim = hidden_dim
-        self.deep_net = nn.Sequential(*deep_layers)
-        self.head = nn.Linear(in_dim + hidden_dim, 1)
+        self.in_proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
+        )
+        self.blocks = nn.ModuleList([SwiGLUBlock(hidden_dim, dropout) for _ in range(num_blocks)])
+        self.head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
 
     def forward(self, num_x, cat_x):
-        feats = [num_x] if num_x.shape[1] > 0 else []
+        feats = []
+        if num_x.shape[1] > 0:
+            feats.append(num_x * self.num_scale)
         if self.embeddings:
             feats.extend([emb(cat_x[:, i]) for i, emb in enumerate(self.embeddings)])
-        x0 = self.in_norm(torch.cat(feats, dim=1))
+        x = self.in_proj(torch.cat(feats, dim=1))
+        for b in self.blocks:
+            x = b(x)
+        return self.head(x).squeeze(-1)
 
-        xc = x0
-        for layer in self.cross_layers:
-            xc = layer(x0, xc)
-        xd = self.deep_net(x0)
-
-        return self.head(torch.cat([xc, xd], dim=1)).squeeze(-1)
-
+# ---------------------------------------------------------
+# KIẾN TRÚC 3: FT-TRANSFORMER VỚI PERIODIC TOKENIZER
+# ---------------------------------------------------------
 class FTTransformer(nn.Module):
     def __init__(self, num_features, cat_dims, d_token=64, n_heads=4, n_layers=3, dropout=0.2):
         super().__init__()
         self.num_features = num_features
         if num_features > 0:
-            self.num_weight = nn.Parameter(torch.randn(num_features, d_token) * 0.02)
-            self.num_bias = nn.Parameter(torch.zeros(num_features, d_token))
+            self.freq_weights = nn.Parameter(torch.randn(num_features, 8) * 0.1)
+            self.num_proj = nn.Linear(17, d_token)
 
         self.cat_embeddings = nn.ModuleList([nn.Embedding(c, d_token) for c in cat_dims])
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_token) * 0.02)
@@ -138,7 +145,10 @@ class FTTransformer(nn.Module):
         tokens = [self.cls_token.expand(B, -1, -1)]
 
         if self.num_features > 0:
-            num_tokens = num_x.unsqueeze(-1) * self.num_weight.unsqueeze(0) + self.num_bias.unsqueeze(0)
+            # Kết hợp giá trị gốc + 16 chiều Fourier cho từng cột số -> chiếu sang d_token
+            v = 2 * np.pi * num_x.unsqueeze(-1) * self.freq_weights.unsqueeze(0)
+            num_feat_vec = torch.cat([num_x.unsqueeze(-1), torch.sin(v), torch.cos(v)], dim=-1)
+            num_tokens = self.num_proj(num_feat_vec)
             tokens.append(num_tokens)
 
         if self.cat_embeddings:
@@ -152,8 +162,8 @@ class FTTransformer(nn.Module):
 def build_model(model_name, num_features, cat_dims):
     if model_name == "resnet":
         return TabularResNet(num_features, cat_dims)
-    elif model_name == "dcnv2":
-        return DCNv2(num_features, cat_dims)
+    elif model_name == "swiglu":
+        return SwiGLUNet(num_features, cat_dims)
     elif model_name == "fttransformer":
         return FTTransformer(num_features, cat_dims)
     else:
