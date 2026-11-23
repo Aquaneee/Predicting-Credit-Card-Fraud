@@ -34,9 +34,10 @@ class TabularDataset(Dataset):
             return self.num_x[idx], self.cat_x[idx], self.y[idx]
         return self.num_x[idx], self.cat_x[idx]
 
-def train_model(model_name):
-    seed_everything(CFG.SEED)
+def train_model(model_name, seed):
+    seed_everything(seed)
     device = torch.device(CFG.DEVICE)
+    tag = model_name if seed == CFG.SEED else f"{model_name}_s{seed}"
 
     train_df = pd.read_parquet(f"{CFG.ARTIFACT_DIR}/train_proc.parquet")
     test_df = pd.read_parquet(f"{CFG.ARTIFACT_DIR}/test_proc.parquet")
@@ -51,10 +52,9 @@ def train_model(model_name):
 
     test_loader = DataLoader(TabularDataset(test_df, num_cols, cat_cols), batch_size=CFG.BATCH_SIZE * 2, shuffle=False)
     scaler = torch.amp.GradScaler("cuda", enabled=CFG.USE_AMP)
-
     warmup_epochs = 3
 
-    print(f"\n================ BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()} ================")
+    print(f"\n================ BẮT ĐẦU HUẤN LUYỆN: {tag.upper()} ================")
     for fold in range(CFG.N_FOLDS):
         trn_df = train_df[train_df["fold"] != fold].reset_index(drop=True)
         val_idx = train_df["fold"] == fold
@@ -86,7 +86,7 @@ def train_model(model_name):
         best_auc = 0.0
         best_val_preds = None
         patience_counter = 0
-        ckpt_path = f"{CFG.ARTIFACT_DIR}/{model_name}_fold{fold}.pt"
+        ckpt_path = f"{CFG.ARTIFACT_DIR}/{tag}_fold{fold}.pt"
 
         for epoch in range(CFG.EPOCHS):
             model.train()
@@ -122,12 +122,9 @@ def train_model(model_name):
                 if patience_counter >= CFG.EARLY_STOPPING_ROUNDS:
                     break
 
-        print(f"[{model_name.upper()}] Fold {fold + 1}/{CFG.N_FOLDS} - Best Val AUC: {best_auc:.5f}")
-        
-        # Rank-normalize trên từng fold để triệt tiêu lệch thang đo giữa các fold
+        print(f"[{tag.upper()}] Fold {fold + 1}/{CFG.N_FOLDS} - Best Val AUC: {best_auc:.5f}")
         oof_preds[val_idx] = rankdata(best_val_preds) / len(best_val_preds)
 
-        # Dự đoán Test và Rank-normalize theo từng fold trước khi cộng trung bình
         model.load_state_dict(torch.load(ckpt_path))
         model.eval()
         fold_test = []
@@ -141,13 +138,14 @@ def train_model(model_name):
         test_preds += (rankdata(fold_test_probs) / len(fold_test_probs)) / CFG.N_FOLDS
 
     overall_auc = roc_auc_score(train_df[target_col].values, oof_preds)
-    print(f">>> [{model_name.upper()}] OVERALL OOF ROC-AUC: {overall_auc:.5f} <<<\n")
+    print(f">>> [{tag.upper()}] OVERALL OOF ROC-AUC: {overall_auc:.5f} <<<\n")
 
-    np.save(f"{CFG.ARTIFACT_DIR}/oof_{model_name}.npy", oof_preds)
-    np.save(f"{CFG.ARTIFACT_DIR}/test_{model_name}.npy", test_preds)
+    np.save(f"{CFG.ARTIFACT_DIR}/oof_{tag}.npy", oof_preds)
+    np.save(f"{CFG.ARTIFACT_DIR}/test_{tag}.npy", test_preds)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, choices=["resnet", "swiglu", "fttransformer"])
+    parser.add_argument("--seed", type=int, default=CFG.SEED)
     args = parser.parse_args()
-    train_model(args.model)
+    train_model(args.model, args.seed)

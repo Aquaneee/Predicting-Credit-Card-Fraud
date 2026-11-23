@@ -1,3 +1,5 @@
+import glob
+import os
 import pickle
 import numpy as np
 import pandas as pd
@@ -18,7 +20,9 @@ def run_ensemble():
     id_col = meta["id_col"]
     y_true = train_df[target_col].values
 
-    models = ["resnet", "swiglu", "fttransformer"]
+    oof_files = sorted(glob.glob(f"{CFG.ARTIFACT_DIR}/oof_*.npy"))
+    models = [os.path.basename(p).replace("oof_", "").replace(".npy", "") for p in oof_files]
+
     oof_dict = {}
     test_dict = {}
 
@@ -27,7 +31,7 @@ def run_ensemble():
         oof = np.load(f"{CFG.ARTIFACT_DIR}/oof_{m}.npy")
         tst = np.load(f"{CFG.ARTIFACT_DIR}/test_{m}.npy")
         auc = roc_auc_score(y_true, oof)
-        print(f"Model {m:15s} | OOF ROC-AUC: {auc:.5f}")
+        print(f"Model {m:22s} | OOF ROC-AUC: {auc:.5f}")
 
         oof_dict[m] = rankdata(oof) / len(oof)
         test_dict[m] = rankdata(tst) / len(tst)
@@ -42,14 +46,14 @@ def run_ensemble():
         return roc_auc_score(y_true, blend_oof)
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=500)
+    study.optimize(objective, n_trials=600)
 
     best_weights = [study.best_params[f"w_{m}"] for m in models]
     best_weights = [w / sum(best_weights) for w in best_weights]
 
     print("\n--- KẾT QUẢ ENSEMBLE TỐI ƯU ---")
     for m, w in zip(models, best_weights):
-        print(f"Trọng số {m:15s}: {w:.4f}")
+        print(f"Trọng số {m:22s}: {w:.4f}")
     print(f"FINAL ENSEMBLE OOF ROC-AUC: {study.best_value:.5f}")
 
     final_test_preds = sum(w * test_dict[m] for w, m in zip(best_weights, models))
